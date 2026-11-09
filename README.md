@@ -7,19 +7,17 @@
 - **Классификация намерений** — определяет, хочет ли пользователь спланировать поездку, уточнить план или восстановить сохранённый
 - **Выбор направления** — подбирает курорт с учётом сезона, активности и бюджета
 - **Уточнение параметров** — запрашивает недостающие данные (даты, бюджет, комфорт)
-- **Внешние инструменты:**
+- **Внешние инструменты (2 реальных API):**
   - 🌤️ Погода (Open-Meteo API) — температура, осадки, сезонные риски
-  - 💰 Стоимость поездки (справочник) — перелёт, проживание, питание, развлечения
-  - 💱 Курсы валют (exchangerate-api.com)
-  - 🏨 Цены на жильё (хостелы, отели, апартаменты, виллы)
-  - ✈️ Варианты транспорта (авиа, ж/д, автобус, аренда)
+  - 💱 Курсы валют (exchangerate-api.com) — актуальные USD/EUR → RUB
+- **LLM-генерация** — стоимость, жильё, транспорт формируются моделью в итоговом плане
 - **Память** — краткосрочная (InMemorySaver) и долгосрочная (JSON-файлы)
 - **FastAPI-интерфейс** — синхронный и стриминговый (SSE)
 - **Gradio UI** — интерактивный чат с полем для API-ключа
 
 ## Архитектура
 
-Граф имеет 8 узлов и 2 условных ребра (3+ пути выполнения):
+Граф имеет **8 узлов** и **2 условных ребра** (5 путей выполнения):
 
 ```mermaid
 graph TD
@@ -27,15 +25,28 @@ graph TD
     classify_intent -->|plan| select_destination
     classify_intent -->|refine| ask_missing_info
     classify_intent -->|recall| load_state
+    classify_intent -->|unknown| __end__
     select_destination --> check_weather_budget
     check_weather_budget -->|OK| build_itinerary
     check_weather_budget -->|bad| suggest_alternatives
     suggest_alternatives --> ask_missing_info
     build_itinerary --> save_state
-    ask_missing_info --> END
     load_state --> END
     save_state --> END
 ```
+
+### Узлы графа
+
+| # | Узел | Модель | Описание |
+|---|------|--------|----------|
+| 1 | `classify_intent` | GigaChat-3-Pro | Классификация намерения: plan / refine / recall / unknown |
+| 2 | `select_destination` | GigaChat-3-Pro | Выбор направления через LLM (без хардкода) |
+| 3 | `ask_missing_info` | GigaChat-3-Pro | Запрос недостающих параметров |
+| 4 | `load_state` | GigaChat-3-Pro | Восстановление состояния из JSON |
+| 5 | `check_weather_budget` | — | Проверка погоды + стоимости + бюджета |
+| 6 | `suggest_alternatives` | GigaChat-3-Pro | Предложение альтернатив при плохой погоде/бюджете |
+| 7 | `build_itinerary` | GigaChat3.5-Reasoning | Детальное составление маршрута |
+| 8 | `save_state` | — | Сериализация состояния в JSON |
 
 ## Быстрый старт
 
@@ -97,11 +108,27 @@ curl -X POST http://localhost:8000/chat \
 ## Структура проекта
 
 ```
-vtroshin/
 ├── app.py              # FastAPI-сервис
 ├── chat_ui.py          # Gradio UI
-├── travel_planner.ipynb # Ноутбук с демонстрацией
 ├── requirements.txt    # Зависимости
 ├── .gitignore
 └── README.md
 ```
+
+## Внешние API
+
+| # | Инструмент | API | Описание |
+|---|-----------|-----|----------|
+| 1 | `get_weather_forecast` | Open-Meteo | Прогноз погоды: температура, осадки |
+| 2 | `get_exchange_rates` | exchangerate-api.com | Курсы валют USD/EUR → RUB |
+
+## Критерии курса
+
+| # | Критерий | Статус |
+|---|----------|--------|
+| 1 | Агент на LLM GigaChat | ✅ GigaChat-3-Pro + GigaChat3.5-Reasoning |
+| 2 | LangGraph | ✅ StateGraph с 8 узлами |
+| 3 | Минимум 2 внешних API | ✅ 2 реальных API + LLM-генерация |
+| 4 | Сохранение состояния | ✅ InMemorySaver + JSON-файлы |
+| 5 | Сложный роутинг (3+ пути) | ✅ 5 путей через 2 условных ребра |
+| 6 | FastAPI | ✅ 5 эндпоинтов, стриминг SSE |
