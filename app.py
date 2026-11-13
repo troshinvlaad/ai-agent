@@ -3,7 +3,7 @@ FastAPI-сервис для Travel Planner агента на базе GigaChat +
 
 Агент использует LLM GigaChat для принятия решений, вызывает внешние API
 через инструменты (tools), сохраняет состояние диалога и маршрутизирует
-запросы через граф LangGraph с 5 путями выполнения.
+запросы через граф LangGraph с 4 путями выполнения.
 
 Запуск: uvicorn app:app --reload --port 8000
 API-ключ: GIGACHAT_KEY (переменная окружения или .env файл)
@@ -65,7 +65,7 @@ class TravelState(TypedDict, total=False):
 
 
 # --- Tools ---
-def get_weather_forecast(lat: float, lon: float, dates: str, location: str = "локация") -> str:
+def get_weather_forecast(lat: float, lon: float, dates: str = "", location: str = "локация") -> str:
     """Получает прогноз погоды для координат через Open-Meteo API.
 
     Args:
@@ -433,7 +433,7 @@ class GetWeatherTool(BaseModel):
     """Получить прогноз погоды по координатам на даты поездки."""
     lat: float = Field(description="Широта (из геокодинга Nominatim)")
     lon: float = Field(description="Долгота (из геокодинга Nominatim)")
-    dates: str = Field(description="Даты поездки в формате YYYY-MM-DD,YYYY-MM-DD")
+    dates: str = Field(default="", description="Даты поездки в формате YYYY-MM-DD,YYYY-MM-DD")
     location: str = Field(default="локация", description="Название места для отображения в ответе")
 
 class GetCostsTool(BaseModel):
@@ -822,37 +822,43 @@ app = FastAPI(title="Travel Planner Agent", version="1.0.0")
 @app.post("/plan_create", response_model=ChatResponse)
 async def plan_create(payload: PlanCreateRequest):
     """Создать новый план поездки — игнорирует старое состояние."""
-    thread_id = f"{payload.user_id}_{payload.session_id}"
+    # Уникальный thread_id для каждого plan_create — чекпоинт будет свежим
+    import time
+    thread_id = f"{payload.user_id}_{payload.session_id}_{int(time.time())}"
     config = {"configurable": {"thread_id": thread_id}}
 
-    # Сбрасываем checkpointer — удаляем старое состояние
-    graph.update_state(config, {"messages": []}, as_node=START)
-
-    # Сбрасываем состояние — начинаем с чистого листа
+    # Формируем параметры — только те, что переданы
     params_dict = {k: v for k, v in payload.__dict__.items() if v is not None}
     user_query = f"/plan_create {json.dumps(params_dict, ensure_ascii=False)}"
 
-    state_update = {
+    # Полное начальное состояние — граф выполнится с нуля
+    initial_state: TravelState = {
+        "user_id": payload.user_id,
+        "session_id": payload.session_id,
         "intent": "plan",
         "user_query": user_query,
-        "messages": [{"role": "user", "content": "/plan_create"}],
+        "messages": [{"role": "user", "content": user_query}],
         "clarification_count": 0,
+        "destination": payload.destination,
+        "departure_city": payload.departure_city,
+        "dates": payload.dates,
+        "budget": payload.budget,
+        "comfort_level": payload.comfort_level,
+        "passengers": payload.passengers,
+        "interests": payload.interests,
+        "special_requests": payload.special_requests,
+        "transport": payload.transport,
+        "api_key": payload.api_key,
+        # Явно сбрасываем — новые значения None
+        "weather": None,
+        "costs": None,
+        "exchange_rate": None,
+        "itinerary": None,
+        "agent_response": "",
+        "alternatives": None,
     }
-    # Очищаем старые параметры
-    for key in ("destination", "departure_city", "dates", "budget",
-                "comfort_level", "passengers", "interests", "special_requests",
-                "transport", "weather", "costs", "exchange_rate", "itinerary"):
-        state_update[key] = None
 
-    # Добавляем новые параметры
-    for key, value in params_dict.items():
-        if key in ("destination", "departure_city", "dates", "budget",
-                   "comfort_level", "passengers", "interests", "special_requests", "transport", "api_key"):
-            state_update[key] = value
-
-    graph.update_state(config, state_update)
-
-    result = graph.invoke(None, config)
+    result = graph.invoke(initial_state, config)
     return ChatResponse(
         response=result.get("agent_response", ""),
         destination=result.get("destination"),
@@ -866,56 +872,50 @@ async def plan_update(payload: PlanUpdateRequest):
     """Обновить существующий план — сохраняет не изменённые параметры."""
     thread_id = f"{payload.user_id}_{payload.session_id}"
     config = {"configurable": {"thread_id": thread_id}}
-    snapshot = graph.get_state(config)
 
-    # Читаем текущее состояние — из checkpointer или из JSON-файла
-    saved = dict(snapshot.values) if snapshot.values else {}
-    if not saved:
-        # Состояние пустое — читаем из JSON-файла
-        states_dir = Path("states")
-        state_file = states_dir / f"{payload.user_id}_{payload.session_id}.json"
-        if state_file.exists():
-            with open(state_file) as f:
-                saved = json.load(f)
-            # Убираем поля, которых нет в TravelState
-            saved = {k: v for k, v in saved.items() if k in TravelState.__annotations__}
+    # Загружаем сохранённое состояние из JSON-файла
+    states_dir = Path("states")
+    state_file = states_dir / f"{payload.user_id}_{payload.session_id}.json"
+    saved = {}
+    if state_file.exists():
+        with open(state_file) as f:
+            saved = json.load(f)
+        # Убираем поля, которых нет в TravelState
+        saved = {k: v for k, v in saved.items() if k in TravelState.__annotations__}
 
     # Копируем ВСЕ параметры из сохранённого состояния
-    update = {
+    # Переопределяем ТОЛЬКО переданные параметры
+    initial_state: TravelState = {
+        "user_id": payload.user_id,
+        "session_id": payload.session_id,
         "intent": "refine",
-        "user_query": "/plan_update",
-        "messages": [{"role": "user", "content": "/plan_update"}],
-        "destination": saved.get("destination"),
-        "departure_city": saved.get("departure_city"),
-        "dates": saved.get("dates"),
-        "budget": saved.get("budget"),
-        "comfort_level": saved.get("comfort_level"),
-        "passengers": saved.get("passengers"),
-        "interests": saved.get("interests"),
-        "special_requests": saved.get("special_requests"),
-        "transport": saved.get("transport"),
-        "api_key": saved.get("api_key"),
+        "user_query": f"/plan_update {json.dumps({k: v for k, v in payload.__dict__.items() if v is not None}, ensure_ascii=False)}",
+        "messages": [{"role": "user", "content": f"/plan_update {json.dumps({k: v for k, v in payload.__dict__.items() if v is not None}, ensure_ascii=False)}"}],
+        "clarification_count": 0,
+        "destination": payload.destination if payload.destination is not None else saved.get("destination"),
+        "departure_city": payload.departure_city if payload.departure_city is not None else saved.get("departure_city"),
+        "dates": payload.dates if payload.dates is not None else saved.get("dates"),
+        "budget": payload.budget if payload.budget is not None else saved.get("budget"),
+        "comfort_level": payload.comfort_level if payload.comfort_level is not None else saved.get("comfort_level"),
+        "passengers": payload.passengers if payload.passengers is not None else saved.get("passengers"),
+        "interests": payload.interests if payload.interests is not None else saved.get("interests"),
+        "special_requests": payload.special_requests if payload.special_requests is not None else saved.get("special_requests"),
+        "transport": payload.transport if payload.transport is not None else saved.get("transport"),
+        "api_key": payload.api_key if payload.api_key is not None else saved.get("api_key"),
+        # Явно сбрасываем — будут пересчитаны
+        "weather": None,
+        "costs": None,
+        "exchange_rate": None,
+        "itinerary": None,
+        "agent_response": "",
+        "alternatives": None,
     }
 
-    # Переопределяем ТОЛЬКО переданные параметры
-    for key in ("destination", "departure_city", "dates", "budget",
-                "comfort_level", "passengers", "interests", "special_requests", "transport", "api_key"):
-        val = getattr(payload, key)
-        if val is not None:
-            update[key] = val
+    # Явно сбрасываем сообщения в чекпоинте — add_messages объединяет с историей,
+    # поэтому без этого старые сообщения остаются и LLM не регенерирует itinerary
+    graph.update_state(config, {"messages": []})
 
-    # Очищаем старые результаты — они будут пересчитаны
-    update["itinerary"] = None
-    update["weather"] = None
-    update["costs"] = None
-    update["exchange_rate"] = None
-    update["agent_response"] = ""
-
-    # Принудительно перезапускаем граф с обновлённым состоянием
-    # Используем update_state с as_node для указания точки входа
-    graph.update_state(config, update, as_node="classify_intent")
-
-    result = graph.invoke(None, config)
+    result = graph.invoke(initial_state, config)
     return ChatResponse(
         response=result.get("agent_response", ""),
         destination=result.get("destination"),

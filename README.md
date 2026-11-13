@@ -16,7 +16,7 @@
 
 **Пример:**
 ```
-/plan_create {"destination": "Сочи", "dates": "2026-04-15,2026-04-22", "budget": 100000, "passengers": 2, "comfort_level": "стандарт"}
+/plan_create {"destination": "Шерегеш", "departure_city": "Нижний Новгород", "dates": "2027-04-01,2027-04-06", "budget": 150000, "passengers": 2, "comfort_level": "стандарт", "transport": "авиа", "interests": "сноубординг", "special_requests": "нужна аренда сноубордов и ботинок, остальное снаряжение есть"}
 ```
 
 ## Возможности
@@ -118,7 +118,7 @@ python chat_ui.py
 ```bash
 curl -X POST http://localhost:8000/plan_create \
   -H "Content-Type: application/json" \
-  -d '{"destination": "Сочи", "dates": "2026-04-15,2026-04-22", "budget": 100000, "passengers": 2, "comfort_level": "стандарт"}'
+  -d '{"destination": "Шерегеш", "departure_city": "Нижний Новгород", "dates": "2027-04-01,2027-04-06", "budget": 150000, "passengers": 2, "comfort_level": "стандарт", "transport": "авиа", "interests": "сноубординг", "special_requests": "нужна аренда сноубордов и ботинок, остальное снаряжение есть"}'
 ```
 
 **Обновить существующий план:**
@@ -162,48 +162,3 @@ curl -X POST http://localhost:8000/plan_update \
 | 2 | `get_exchange_rates` | exchangerate-api.com | Курсы валют USD/EUR → RUB |
 | 3 | `get_geolocation` | Nominatim (OSM) | Координаты и страна по названию города |
 | — | `get_travel_costs` | — | Заглушка (стоимость рассчитывает LLM) |
-
-## Структура кода
-
-### Состояние и данные
-
-| # | Название | Тип | Описание |
-|---|----------|-----|----------|
-| 1 | `TravelState` | TypedDict | Состояние агента — параметры поездки, история, флаги API |
-| 2 | `ChatRequest` | Pydantic | Запрос к `/chat` |
-| 3 | `ChatResponse` | Pydantic | Ответ от `/chat` |
-| 4 | `PlanCreateRequest` | Pydantic | Запрос к `/plan_create` |
-| 5 | `PlanUpdateRequest` | Pydantic | Запрос к `/plan_update` |
-
-### Внешние API-инструменты
-
-| # | Название | API | Описание |
-|---|----------|-----|----------|
-| 6 | `get_weather_forecast` | Open-Meteo | Прогноз погоды |
-| 7 | `get_exchange_rates` | exchangerate-api | Курсы валют |
-| 8 | `get_geolocation` | Nominatim/OSM | Координаты города |
-| 9 | `get_travel_costs` | — | Заглушка (рассчитывает LLM) |
-
-### Ядро агента
-
-| # | Название | Описание |
-|---|----------|----------|
-| 10 | `llm_call` | Вызов GigaChat через OpenAI SDK с поддержкой tools и JSON-структуры |
-| 11 | `show_template` | Показывает команды /plan_create и /plan_update |
-| 12 | `classify_intent` | Парсит команды, фильтрует запросы про путешествия |
-| 13 | `check_weather_budget` | Агентный цикл: LLM вызывает внешние API |
-| 14 | `build_itinerary` | Генерирует детальный план поездки |
-| 15 | `save_state` | Сохраняет состояние в JSON-файл |
-| 16 | `load_state` | Восстанавливает состояние из JSON-файла |
-| 17 | `route_intent` | Роутинг: plan → check_weather_budget, recall → load_state |
-
-## Критерии курса
-
-| # | Критерий | Статус |
-|---|----------|--------|
-| 1 | Агент на LLM GigaChat | ✅ GigaChat-3-Pro через OpenAI SDK |
-| 2 | LangGraph | ✅ StateGraph с 5 узлами |
-| 3 | Минимум 2 внешних API | ✅ 3 общедоступных API (без ключей) |
-| 4 | Сохранение состояния | ✅ InMemorySaver + JSON-файлы |
-| 5 | Сложный роутинг (3+ пути) | ✅ 4 пути через 1 условное ребро |
-| 6 | FastAPI | ✅ 6 эндпоинтов |
