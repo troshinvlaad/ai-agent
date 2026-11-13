@@ -1,35 +1,49 @@
 # Travel Planner — ИИ-агент для планирования путешествий
 
-> Агент на базе LangGraph с внешними инструментами, памятью и FastAPI-интерфейсом.
+> Агент на базе LLM GigaChat + LangGraph с внешними инструментами, памятью и FastAPI-интерфейсом.
+
+## User Story
+
+**Как** путешественник, я хочу быстро спланировать поездку, чтобы получить детальный маршрут с учётом бюджета, погоды и моих интересов.
+
+**Сценарий использования:**
+
+1. Пользователь отправляет `/plan_create` с параметрами поездки
+2. Агент проверяет погоду и курсы валют через внешние API
+3. LLM генерирует детальный план с транспортом, жильём и развлечениями
+4. План сохраняется в JSON-файл
+5. Пользователь может обновить план через `/plan_update`
+
+**Пример:**
+```
+/plan_create {"destination": "Сочи", "dates": "2026-04-15,2026-04-22", "budget": 100000, "passengers": 2, "comfort_level": "стандарт"}
+```
 
 ## Возможности
 
-- **Классификация намерений** — определяет, хочет ли пользователь спланировать поездку, уточнить план или восстановить сохранённый
-- **Выбор направления** — подбирает курорт с учётом сезона, активности и бюджета
-- **Уточнение параметров** — запрашивает недостающие данные (даты, бюджет, комфорт)
-- **Внешние инструменты (2 реальных API):**
+- **Команды с JSON** — `/plan_create` (новый план) и `/plan_update` (обновление)
+- **Внешние инструменты (3 общедоступных API, без ключей):**
   - 🌤️ Погода (Open-Meteo API) — температура, осадки, сезонные риски
   - 💱 Курсы валют (exchangerate-api.com) — актуальные USD/EUR → RUB
-- **LLM-генерация** — стоимость, жильё, транспорт формируются моделью в итоговом плане
+  - 📍 Геокодинг (Nominatim / OpenStreetMap) — координаты и страна по названию города
+- **Агентный цикл** — LLM решает, какие внешние API вызвать, и собирает результат
+- **LLM-генерация** — стоимость, жильё, транспорт формируются моделью на основе реальных данных из API
 - **Память** — краткосрочная (InMemorySaver) и долгосрочная (JSON-файлы)
-- **FastAPI-интерфейс** — синхронный и стриминговый (SSE)
+- **FastAPI-интерфейс** — синхронный
 - **Gradio UI** — интерактивный чат с полем для API-ключа
 
 ## Архитектура
 
-Граф имеет **8 узлов** и **2 условных ребра** (5 путей выполнения):
+Граф имеет **5 узлов** и **1 условное ребро** (4 пути выполнения):
 
 ```mermaid
 graph TD
     START --> classify_intent
-    classify_intent -->|plan| select_destination
-    classify_intent -->|refine| ask_missing_info
+    classify_intent -->|plan| check_weather_budget
+    classify_intent -->|refine| check_weather_budget
     classify_intent -->|recall| load_state
     classify_intent -->|unknown| __end__
-    select_destination --> check_weather_budget
-    check_weather_budget -->|OK| build_itinerary
-    check_weather_budget -->|bad| suggest_alternatives
-    suggest_alternatives --> ask_missing_info
+    check_weather_budget --> build_itinerary
     build_itinerary --> save_state
     load_state --> END
     save_state --> END
@@ -39,14 +53,20 @@ graph TD
 
 | # | Узел | Модель | Описание |
 |---|------|--------|----------|
-| 1 | `classify_intent` | GigaChat-3-Pro | Классификация намерения: plan / refine / recall / unknown |
-| 2 | `select_destination` | GigaChat-3-Pro | Выбор направления через LLM (без хардкода) |
-| 3 | `ask_missing_info` | GigaChat-3-Pro | Запрос недостающих параметров |
-| 4 | `load_state` | GigaChat-3-Pro | Восстановление состояния из JSON |
-| 5 | `check_weather_budget` | — | Проверка погоды + стоимости + бюджета |
-| 6 | `suggest_alternatives` | GigaChat-3-Pro | Предложение альтернатив при плохой погоде/бюджете |
-| 7 | `build_itinerary` | GigaChat3.5-Reasoning | Детальное составление маршрута |
-| 8 | `save_state` | — | Сериализация состояния в JSON |
+| 1 | `classify_intent` | — | Парсинг команд /plan_create и /plan_update, фильтрация запросов |
+| 2 | `load_state` | — | Восстановление состояния из JSON |
+| 3 | `check_weather_budget` | GigaChat-3-Pro | Агентный цикл: LLM вызывает внешние API |
+| 4 | `build_itinerary` | GigaChat-3-Pro | Детальное составление маршрута |
+| 5 | `save_state` | — | Сериализация состояния в JSON |
+
+## Путь выполнения
+
+| Путь | Сценарий |
+|------|----------|
+| 1 | Создать план: `classify_intent → check_weather_budget → build_itinerary → save_state → END` |
+| 2 | Обновить план: `classify_intent → check_weather_budget → build_itinerary → save_state → END` |
+| 3 | Восстановить: `classify_intent → load_state → END` |
+| 4 | Не про путешествия: `classify_intent → END` |
 
 ## Быстрый старт
 
@@ -62,6 +82,12 @@ pip install -r requirements.txt
 export GIGACHAT_KEY="ваш_ключ"
 ```
 
+Или создайте файл `.env`:
+
+```
+GIGACHAT_KEY=ваш_ключ
+```
+
 ### 3. Запуск
 
 **Вариант A — FastAPI-сервис:**
@@ -69,41 +95,54 @@ export GIGACHAT_KEY="ваш_ключ"
 uvicorn app:app --reload --port 8000
 ```
 
-**Вариант B — Gradio UI:**
+**Вариант B — FastAPI-сервис + Gradio UI:**
+После запуска FastAPI-сервиса необходимо запустить Gradio UI
 ```bash
 python chat_ui.py
-```
-
-**Вариант C — jupyter notebook:**
-```bash
-jupyter notebook travel_planner.ipynb
 ```
 
 ## API-эндпоинты
 
 | Метод | URL | Описание |
 |-------|-----|----------|
-| POST | `/chat` | Основной вход (синхронный) |
-| POST | `/chat/stream` | Стриминг через SSE |
+| POST | `/plan_create` | Создать новый план поездки |
+| POST | `/plan_update` | Обновить существующий план |
+| POST | `/chat` | Общий чат (для уточнений) |
 | GET | `/state/{session_id}` | Получение состояния сессии |
 | POST | `/reset/{session_id}` | Очистка сессии |
 | GET | `/health` | Health-check |
 
-## Пример запроса
-
-```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Хочу поехать в тепло в феврале"}'
-```
-
 ## Примеры запросов
 
-- «Хочу на горнолыжный курорт в начале апреля из Нижнего Новгорода»
-- «Пляжный отдых в феврале, бюджет 70 000 рублей»
-- «Тропики и море на неделю, премиум уровень»
-- «Бюджетно и недалеко — куда поехать в марте?»
-- «Хочу в Иорданию на 5 дней, стандартный комфорт»
+**Создать новый план:**
+```bash
+curl -X POST http://localhost:8000/plan_create \
+  -H "Content-Type: application/json" \
+  -d '{"destination": "Сочи", "dates": "2026-04-15,2026-04-22", "budget": 100000, "passengers": 2, "comfort_level": "стандарт"}'
+```
+
+**Обновить существующий план:**
+```bash
+curl -X POST http://localhost:8000/plan_update \
+  -H "Content-Type: application/json" \
+  -d '{"budget": 150000, "destination": "Сочи"}'
+```
+
+**Доступные поля:**
+- `destination` — куда ехать (Сочи, Шерегеш, Турция)
+- `departure_city` — откуда (Москва, СПб)
+- `dates` — даты в формате YYYY-MM-DD,YYYY-MM-DD
+- `budget` — общий бюджет на всех (число)
+- `passengers` — количество пассажиров (число)
+- `comfort_level` — бюджет/стандарт/премиум
+- `transport` — авиа/жд/авто
+- `interests` — интересы (пляж, экскурсии)
+- `special_requests` — пожелания
+
+## Механизм восстановления сессии
+
+Состояние сохраняется в JSON-файл после генерации плана.
+Восстановить можно через `/plan_update` — он сохранит все параметры, не изменённые явно.
 
 ## Структура проекта
 
@@ -121,14 +160,50 @@ curl -X POST http://localhost:8000/chat \
 |---|-----------|-----|----------|
 | 1 | `get_weather_forecast` | Open-Meteo | Прогноз погоды: температура, осадки |
 | 2 | `get_exchange_rates` | exchangerate-api.com | Курсы валют USD/EUR → RUB |
+| 3 | `get_geolocation` | Nominatim (OSM) | Координаты и страна по названию города |
+| — | `get_travel_costs` | — | Заглушка (стоимость рассчитывает LLM) |
+
+## Структура кода
+
+### Состояние и данные
+
+| # | Название | Тип | Описание |
+|---|----------|-----|----------|
+| 1 | `TravelState` | TypedDict | Состояние агента — параметры поездки, история, флаги API |
+| 2 | `ChatRequest` | Pydantic | Запрос к `/chat` |
+| 3 | `ChatResponse` | Pydantic | Ответ от `/chat` |
+| 4 | `PlanCreateRequest` | Pydantic | Запрос к `/plan_create` |
+| 5 | `PlanUpdateRequest` | Pydantic | Запрос к `/plan_update` |
+
+### Внешние API-инструменты
+
+| # | Название | API | Описание |
+|---|----------|-----|----------|
+| 6 | `get_weather_forecast` | Open-Meteo | Прогноз погоды |
+| 7 | `get_exchange_rates` | exchangerate-api | Курсы валют |
+| 8 | `get_geolocation` | Nominatim/OSM | Координаты города |
+| 9 | `get_travel_costs` | — | Заглушка (рассчитывает LLM) |
+
+### Ядро агента
+
+| # | Название | Описание |
+|---|----------|----------|
+| 10 | `llm_call` | Вызов GigaChat через OpenAI SDK с поддержкой tools и JSON-структуры |
+| 11 | `show_template` | Показывает команды /plan_create и /plan_update |
+| 12 | `classify_intent` | Парсит команды, фильтрует запросы про путешествия |
+| 13 | `check_weather_budget` | Агентный цикл: LLM вызывает внешние API |
+| 14 | `build_itinerary` | Генерирует детальный план поездки |
+| 15 | `save_state` | Сохраняет состояние в JSON-файл |
+| 16 | `load_state` | Восстанавливает состояние из JSON-файла |
+| 17 | `route_intent` | Роутинг: plan → check_weather_budget, recall → load_state |
 
 ## Критерии курса
 
 | # | Критерий | Статус |
 |---|----------|--------|
-| 1 | Агент на LLM GigaChat | ✅ GigaChat-3-Pro + GigaChat3.5-Reasoning |
-| 2 | LangGraph | ✅ StateGraph с 8 узлами |
-| 3 | Минимум 2 внешних API | ✅ 2 реальных API + LLM-генерация |
+| 1 | Агент на LLM GigaChat | ✅ GigaChat-3-Pro через OpenAI SDK |
+| 2 | LangGraph | ✅ StateGraph с 5 узлами |
+| 3 | Минимум 2 внешних API | ✅ 3 общедоступных API (без ключей) |
 | 4 | Сохранение состояния | ✅ InMemorySaver + JSON-файлы |
-| 5 | Сложный роутинг (3+ пути) | ✅ 5 путей через 2 условных ребра |
-| 6 | FastAPI | ✅ 5 эндпоинтов, стриминг SSE |
+| 5 | Сложный роутинг (3+ пути) | ✅ 4 пути через 1 условное ребро |
+| 6 | FastAPI | ✅ 6 эндпоинтов |

@@ -11,6 +11,8 @@ import httpx
 import gradio as gr
 
 API_URL = "http://localhost:8000/chat"
+PLAN_CREATE_URL = "http://localhost:8000/plan_create"
+PLAN_UPDATE_URL = "http://localhost:8000/plan_update"
 
 
 def chat(message, history, api_key):
@@ -26,39 +28,69 @@ def chat(message, history, api_key):
         Ответ агента — ChatInterface сам форматирует в messages
     """
     if not api_key or api_key.strip() == "":
-        return "⚠️ Введите GigaChat API-ключ в поле выше перед отправкой сообщения."
+        return "⚠️ Введите GigaChat API-ключ в поле ниже перед отправкой сообщения."
     
-    # Формируем контекст из истории чата
-    context_messages = []
-    if history:
-        for msg in history:
-            if isinstance(msg, dict):
-                # Формат Gradio 6: {"role": "user", "content": "..."}
-                if msg.get("role") == "user":
-                    context_messages.append(f"Пользователь: {msg.get('content', '')}")
-                elif msg.get("role") == "assistant":
-                    context_messages.append(f"Агент: {msg.get('content', '')}")
-            elif isinstance(msg, (list, tuple)) and len(msg) == 2:
-                # Формат (user_msg, assistant_msg)
-                user_part = str(msg[0]) if msg[0] else ""
-                assistant_part = str(msg[1]) if msg[1] else ""
-                if user_part:
-                    context_messages.append(f"Пользователь: {user_part}")
-                if assistant_part:
-                    context_messages.append(f"Агент: {assistant_part}")
+    # Определяем команду
+    if message.startswith("/plan_create"):
+        url = PLAN_CREATE_URL
+        payload = {
+            "user_id": "local_user",
+            "session_id": "local_session",
+            "api_key": api_key,
+        }
+        try:
+            import json
+            params = json.loads(message.split(None, 1)[1])
+            for k, v in params.items():
+                payload[k] = v
+        except (json.JSONDecodeError, IndexError):
+            return "⚠️ Неверный формат JSON. Пример:\n```json\n{\"destination\": \"Сочи\", \"dates\": \"2026-04-15,2026-04-22\", \"budget\": 100000, \"passengers\": 2, \"comfort_level\": \"стандарт\"}\n```"
     
-    context = "\n".join(context_messages) if context_messages else "Новый диалог"
+    elif message.startswith("/plan_update"):
+        url = PLAN_UPDATE_URL
+        payload = {
+            "user_id": "local_user",
+            "session_id": "local_session",
+            "api_key": api_key,
+        }
+        try:
+            import json
+            params = json.loads(message.split(None, 1)[1])
+            for k, v in params.items():
+                payload[k] = v
+        except (json.JSONDecodeError, IndexError):
+            return "⚠️ Неверный формат JSON. Пример:\n```json\n{\"budget\": 150000, \"passengers\": 3}\n```"
     
-    payload = {
-        "user_id": "local_user",
-        "session_id": "local_session",
-        "message": message,
-        "context": context,  # передаём историю
-        "api_key": api_key
-    }
+    else:
+        url = API_URL
+        context_messages = []
+        if history:
+            for msg in history:
+                if isinstance(msg, dict):
+                    if msg.get("role") == "user":
+                        context_messages.append(f"Пользователь: {msg.get('content', '')}")
+                    elif msg.get("role") == "assistant":
+                        context_messages.append(f"Агент: {msg.get('content', '')}")
+                elif isinstance(msg, (list, tuple)) and len(msg) == 2:
+                    user_part = str(msg[0]) if msg[0] else ""
+                    assistant_part = str(msg[1]) if msg[1] else ""
+                    if user_part:
+                        context_messages.append(f"Пользователь: {user_part}")
+                    if assistant_part:
+                        context_messages.append(f"Агент: {assistant_part}")
+        
+        context = "\n".join(context_messages) if context_messages else "Новый диалог"
+        
+        payload = {
+            "user_id": "local_user",
+            "session_id": "local_session",
+            "message": message,
+            "context": context,
+            "api_key": api_key,
+        }
     
     try:
-        resp = httpx.post(API_URL, json=payload, timeout=120)
+        resp = httpx.post(url, json=payload, timeout=120)
         resp.raise_for_status()
         data = resp.json()
         
@@ -88,6 +120,12 @@ def chat(message, history, api_key):
 
 
 if __name__ == "__main__":
+    # Подсказки команд при вводе /
+    command_hints = [
+        "/plan_create",
+        "/plan_update",
+    ]
+    
     demo = gr.ChatInterface(
         chat,
         title="🌍 Travel Planner — Планировщик путешествий",
@@ -97,9 +135,14 @@ if __name__ == "__main__":
         Агент учитывает:
         - 🌤️ Погоду (Open-Meteo API)
         - 💱 Курсы валют (exchangerate-api.com)
+        - 📍 Геокодинг (Nominatim / OpenStreetMap)
         - 🗺️ LLM-генерация плана с бюджетом, жильём и транспортом
         
-        **Важно:** сначала запустите FastAPI-сервер (см. инструкцию ниже)
+        **Важно:** сначала запустите FastAPI-сервер
+        
+        **Команды:**
+        - `/plan_create` — создать новый план
+        - `/plan_update` — обновить существующий план
         """,
         additional_inputs=[
             gr.Textbox(
@@ -108,13 +151,11 @@ if __name__ == "__main__":
                 type="password",
             )
         ],
-        examples=[
-            [["Хочу на горнолыжный курорт в начале апреля из Нижнего Новгорода"]],
-            [["Пляжный отдых в феврале, бюджет 70 000 рублей"]],
-            [["Тропики и море на неделю, премиум уровень"]],
-            [["Бюджетно и недалеко — куда поехать в марте?"]],
-            [["Хочу в Иорданию на 5 дней, стандартный комфорт"]],
-        ],
+        examples=[],
+        textbox=gr.Textbox(
+            placeholder="Напишите сообщение или введите / для команд...",
+            show_label=False,
+        ),
     )
     
     demo.launch(

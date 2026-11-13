@@ -1,38 +1,44 @@
 """
-FastAPI-сервис для Travel Planner агента.
+FastAPI-сервис для Travel Planner агента на базе GigaChat + LangGraph.
+
+Агент использует LLM GigaChat для принятия решений, вызывает внешние API
+через инструменты (tools), сохраняет состояние диалога и маршрутизирует
+запросы через граф LangGraph с 5 путями выполнения.
+
 Запуск: uvicorn app:app --reload --port 8000
+API-ключ: GIGACHAT_KEY (переменная окружения или .env файл)
 """
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Annotated, Literal
 from typing_extensions import TypedDict
 import json
 import os
-import httpx
+import requests
 from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
 
-from openai import OpenAI
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import InMemorySaver
+# Загружаем переменные окружения из .env файла
+load_dotenv()
 
 # --- Конфигурация ---
 BASE_URL = "https://foundation-models.api.cloud.ru/v1"
 DEFAULT_MODEL = "GigaChat/GigaChat-3-Pro"
-REASONING_MODEL = "ai-sage/GigaChat3.5-432B-A28B-Reasoning"
-
-# Ключ можно задать через переменную окружения ИЛИ передать в запросе
 GIGACHAT_KEY = os.environ.get("GIGACHAT_KEY", "")
 
-# Глобальный клиент по умолчанию (будет перезаписан при каждом запросе с новым ключом)
-client = OpenAI(api_key=GIGACHAT_KEY, base_url=BASE_URL) if GIGACHAT_KEY else None
+# --- Импорт LangGraph ---
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import InMemorySaver
+from openai import OpenAI, pydantic_function_tool
 
 
 # --- State ---
 class TravelState(TypedDict, total=False):
+    """Состояние Travel Planner агента. Хранит все данные сессии: параметры поездки,
+    историю сообщений, флаги статуса внешних API и счётчики уточнений."""
     user_id: str
     session_id: str
     messages: Annotated[List[dict], add_messages]
@@ -41,567 +47,713 @@ class TravelState(TypedDict, total=False):
     dates: Optional[str]
     budget: Optional[float]
     comfort_level: Optional[str]
+    passengers: Optional[int]
+    departure_city: Optional[str]
+    interests: Optional[str]
+    special_requests: Optional[str]
+    transport: Optional[str]
     weather: Optional[str]
     costs: Optional[str]
-    weather_ok: Optional[bool]
-    budget_ok: Optional[bool]
+    exchange_rate: Optional[str]
     alternatives: Optional[str]
     itinerary: Optional[str]
     user_query: str
     agent_response: str
-    asked_missing_info: bool  # флаг: уже задавали уточняющие вопросы
-    api_key: Optional[str]  # ключ GigaChat для текущего запроса
+    asked_missing_info: bool
+    clarification_count: int
+    api_key: Optional[str]
 
 
 # --- Tools ---
-def get_weather_forecast(location: str, dates: str) -> str:
+def get_weather_forecast(lat: float, lon: float, dates: str, location: str = "локация") -> str:
+    """Получает прогноз погоды для координат через Open-Meteo API.
+
+    Args:
+        lat: Широта (из Nominatim).
+        lon: Долгота (из Nominatim).
+        dates: Даты поездки в формате YYYY-MM-DD,YYYY-MM-DD.
+        location: Название места для отображения в ответе.
+
+    Returns:
+        Строка с прогнозом погоды или сообщение о недоступности.
+    """
     try:
-        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={location}&count=1&language=ru"
-        with httpx.Client(timeout=10.0) as http:
-            geo_resp = http.get(geo_url)
-            geo_data = geo_resp.json()
-            if "results" not in geo_data or not geo_data["results"]:
-                return f"Город '{location}' не найден."
-            lat = geo_data["results"][0]["latitude"]
-            lon = geo_data["results"][0]["longitude"]
-            name = geo_data["results"][0]["name"]
-            weather_url = (
-                f"https://api.open-meteo.com/v1/forecast"
-                f"?latitude={lat}&longitude={lon}"
-                f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode"
-                f"&timezone=auto"
-            )
-            weather_resp = http.get(weather_url)
-            weather_data = weather_resp.json()
-            daily = weather_data.get("daily", {})
-            temps_max = daily.get("temperature_2m_max", [])
-            temps_min = daily.get("temperature_2m_min", [])
-            precip = daily.get("precipitation_sum", [])
-            codes = daily.get("weathercode", [])
-            days = daily.get("time", [])
-            if not temps_max:
-                return "Сервис погоды недоступен."
-            avg_temp = sum(temps_max) / len(temps_max)
-            total_precip = sum(precip) if precip else 0
-            def weather_desc(code):
-                descriptions = {
-                    0: "Ясно", 1: "Преимущественно ясно", 2: "Переменная облачность",
-                    3: "Пасмурно", 61: "Дождь", 71: "Снег", 95: "Гроза"
-                }
-                return descriptions.get(code, "Неизвестно")
-            result = (
-                f"**Погода в {name}**: "
-                f"Средняя макс. {avg_temp:.1f}°C, мин. {min(temps_min):.1f}°C, "
-                f"осадки {total_precip:.1f} мм, погода: {weather_desc(codes[0] if codes else 0)}"
-            )
-            return result
+        weather_url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode"
+            f"&timezone=auto"
+        )
+        weather_resp = requests.get(weather_url, timeout=10.0)
+        weather_data = weather_resp.json()
+        daily = weather_data.get("daily", {})
+        temps_max = daily.get("temperature_2m_max", [])
+        temps_min = daily.get("temperature_2m_min", [])
+        precip = daily.get("precipitation_sum", [])
+        codes = daily.get("weathercode", [])
+        if not temps_max:
+            return "Сервис погоды недоступен."
+        avg_temp = sum(temps_max) / len(temps_max)
+        total_precip = sum(precip) if precip else 0
+        def weather_desc(code):
+            return {0: "Ясно", 1: "Преимущественно ясно", 2: "Переменная облачность",
+                    3: "Пасмурно", 61: "Дождь", 71: "Снег", 95: "Гроза"}.get(code, "Неизвестно")
+        return (f"**Погода в {location}**: Средняя макс. {avg_temp:.1f}°C, "
+                f"мин. {min(temps_min):.1f}°C, осадки {total_precip:.1f} мм, "
+                f"погода: {weather_desc(codes[0] if codes else 0)}")
+    except (requests.Timeout, requests.ConnectionError, requests.exceptions.RequestException):
+        return "Сервис погоды временно недоступен (таймаут/ошибка соединения)."
     except Exception as e:
-        return f"Ошибка погоды: {e}."
+        return f"Сервис погоды недоступен: {e}."
 
 
 def get_travel_costs(location: str, days: int, comfort_level: str) -> str:
-    """
-    Возвращает placeholder — реальная стоимость формируется LLM в build_itinerary.
-
-    Args:
-        location: Название направления.
-        days: Количество дней поездки.
-        comfort_level: Уровень комфорта.
-
-    Returns:
-        Строка-заглушка, стоимость рассчитывается LLM.
-    """
-    return f"Стоимость поездки в {location} ({days} дн.) будет рассчитана в итоговом плане."
+    return f"Стоимость в {location} ({days} дн., {comfort_level}) будет рассчитана LLM."
 
 
 def get_exchange_rates(from_currency="USD", to_currency="RUB") -> str:
     try:
         url = f"https://api.exchangerate-api.com/v4/latest/{from_currency}"
-        with httpx.Client(timeout=10.0) as http:
-            resp = http.get(url)
-            resp.raise_for_status()
-            data = resp.json()
-            rate = data["rates"].get(to_currency)
-            if rate is None:
-                return f"Валюта {to_currency} не найдена."
-            return f"1 {from_currency} = {rate} {to_currency}"
+        resp = requests.get(url, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+        rate = data["rates"].get(to_currency)
+        if rate is None:
+            return f"Валюта {to_currency} не найдена."
+        return f"1 {from_currency} = {rate} {to_currency}"
+    except (requests.Timeout, requests.ConnectionError, requests.exceptions.RequestException):
+        return f"Сервис курсов валют временно недоступен."
     except Exception as e:
-        return f"Ошибка курса: {e}."
+        return f"Сервис курсов валют недоступен: {e}."
 
 
-# --- LLM Call ---
-def llm_call(dialog: list, structure=None, model: str = DEFAULT_MODEL,
+def get_geolocation(location: str) -> str:
+    try:
+        url = f"https://nominatim.openstreetmap.org/search?q={location}&format=json&limit=1&addressdetails=1"
+        headers = {"User-Agent": "TravelPlanner/1.0"}
+        resp = requests.get(url, headers=headers, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            return f"Место '{location}' не найдено."
+        item = data[0]
+        addr = item.get("address", {})
+        country = addr.get("country", "неизвестно")
+        city = addr.get("city") or addr.get("town") or location
+        return f"**{city}, {country}**: {item['lat']}, {item['lon']}"
+    except (requests.Timeout, requests.ConnectionError, requests.exceptions.RequestException):
+        return f"Сервис геокодинга временно недоступен."
+    except Exception as e:
+        return f"Сервис геокодинга недоступен: {e}."
+
+
+# --- LLM Call через OpenAI SDK (паттерн из 6-го занятия) ---
+def llm_call(dialog, structure=None, model: str = DEFAULT_MODEL,
              temperature: float = 0.0, max_tokens: int = 4096,
-             timeout: float = 120.0, api_key: Optional[str] = None) -> dict | str:
-    """
-    Универсальная функция вызова LLM.
+             timeout: float = 60.0, api_key: Optional[str] = None) -> dict | str:
+    """Вызов GigaChat через OpenAI SDK. LLM всегда доступна."""
+    key = api_key or GIGACHAT_KEY
+    client = OpenAI(
+        api_key=key,
+        base_url="https://foundation-models.api.cloud.ru/v1",
+    )
 
-    Args:
-        dialog: Список сообщений для диалога.
-        structure: Pydantic-модель для структурного вывода.
-        model: Название модели.
-        temperature: Температура генерации.
-        max_tokens: Максимальное количество токенов (по умолчанию 4096).
-        timeout: Таймаут ожидания ответа в секундах (по умолчанию 120).
-        api_key: Ключ GigaChat (если не передан — используется глобальный).
-
-    Returns:
-        Структурированные данные (dict) или текстовый ответ (str).
-
-    Raises:
-        httpx.TimeoutException: Если модель не ответила за timeout секунд.
-    """
-    local_client = OpenAI(api_key=api_key, base_url=BASE_URL, timeout=timeout) if api_key else (client if client else OpenAI(api_key=GIGACHAT_KEY, base_url=BASE_URL, timeout=timeout))
-
-    request_params = {
-        "model": model,
-        "messages": dialog,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if structure is not None:
-        response = local_client.chat.completions.parse(
-            model=model, messages=dialog, temperature=temperature,
-            max_tokens=max_tokens, response_format=structure,
+    if structure:
+        response = client.chat.completions.parse(
+            model=model,
+            messages=dialog,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
         )
-        return response.choices[0].message.parsed.model_dump()
+        return json.loads(response.choices[0].message.content)
     else:
-        response = local_client.chat.completions.create(**request_params)
+        response = client.chat.completions.create(
+            model=model,
+            messages=dialog,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
         return response.choices[0].message.content
 
 
 # --- Node functions ---
-def classify_intent(state: TravelState) -> dict:
-    """
-    Классифицирует намерение пользователя: plan / refine / recall / unknown.
-    Парсит даты из запроса регулярными выражениями.
-
-    Args:
-        state: Текущее состояние графа.
-
-    Returns:
-        Словарь с intent, user_query, messages и распарсенными датами.
-    """
-    from pydantic import BaseModel
-    import re
-    class IntentFormat(BaseModel):
-        intent: Literal["plan", "refine", "recall", "unknown"]
-        missing_fields: List[str] = []
-    user_query = state.get("user_query", "")
-    user_query_lower = user_query.lower()
-    messages = state.get("messages", [])
-    api_key = state.get("api_key")
-    
-    # Парсим даты из запроса
-    parsed_dates = None
-    date_patterns = [
-        r"(\d{1,2}[./-]\d{1,2}[./-]\d{4})",  # 01.04.2027
-        r"(\d{1,2}[./-]\d{1,2}[./-]\d{2})",   # 01.04.27
-        r"(\d{4}-\d{2}-\d{2})",                # 2027-04-01
-    ]
-    for pattern in date_patterns:
-        match = re.search(pattern, user_query)
-        if match:
-            parsed_dates = match.group(1)
-            break
-    
-    # Парсим количество дней
-    parsed_days = None
-    days_match = re.search(r"по\s+(\d{1,2}[./-]\d{1,2}[./-]\d{4})", user_query)
-    if days_match:
-        end_date = days_match.group(1)
-        if parsed_dates:
-            parsed_dates = f"{parsed_dates},{end_date}"
-    
-    # Общие вопросы — определяем без LLM
-    general_keywords = ["что ты умеешь", "что ты можешь", "помоги", "как работает", "что это", "help"]
-    if any(kw in user_query_lower for kw in general_keywords):
-        return {"intent": "unknown", "user_query": user_query,
-                "agent_response": "Я — Travel Planner, агент для планирования путешествий. Могу помочь:\n\n"
-                                   "• Подобрать направление по вашим предпочтениям (погода, бюджет, сезон)\n"
-                                   "• Проверить погоду в выбранном месте\n"
-                                   "• Рассчитать стоимость поездки (перелёт, отель, питание)\n"
-                                   "• Предложить варианты жилья и транспорта\n"
-                                   "• Составить детальный план поездки по дням\n\n"
-                                   "Примеры запросов:\n"
-                                   "• «Хочу на горнолыжный курорт в апреле»\n"
-                                   "• «Пляжный отдых в феврале, бюджет 70 000 рублей»\n"
-                                   "• «Куда поехать в марте бюджетно?»\n"
-                                   "• «Составь план поездки в Иорданию на 5 дней»"}
-    
-    # Формируем полный диалог с историей
-    dialog = [
-        {"role": "system", "content": """Ты — Travel Planner. Определи намерение:
-plan = хочет спланировать поездку (есть запрос про путешествие, курорт, отель, даты, бюджет и т.д.)
-refine = хочет уточнить или изменить существующий план (есть слова: измени, другие даты, перенеси, хочу в апреле, хочу в мае)
-recall = хочет восстановить сохранённый план
-unknown = не относится к путешествиям
-
-Примеры:
-- "Хочу на горнолыжный курорт" → plan
-- "Куда поехать в феврале?" → plan
-- "Измени даты на март" → refine
-- "Хочу в апреле" → refine
-- "Покажи мой план" → recall
-- "Что ты умеешь?" → unknown"""},
-    ]
-    
-    # Добавляем историю чата
-    if messages:
-        for msg in messages:
-            if isinstance(msg, dict) and msg.get("role") in ("user", "assistant"):
-                dialog.append(msg)
-    
-    # Добавляем текущий запрос
-    dialog.append({"role": "user", "content": user_query})
-    
-    result = llm_call(dialog, structure=IntentFormat, max_tokens=256, api_key=api_key)
-    
-    # Формируем ответ
-    response = {
-        "intent": result["intent"],
-        "user_query": user_query,
-        "messages": [{"role": "assistant", "content": f"Намерение: {result['intent']}"}],
+def show_template(state: TravelState) -> dict:
+    """Показать шаблон с командами для заполнения."""
+    template = (
+        "🌍 **Travel Planner — заполните параметры поездки:**\n\n"
+        "Используйте команды с JSON:\n\n"
+        "**/plan_create** — создать новый план:\n"
+        "```json\n"
+        '{"destination": "Шерегеш", "departure_city": "Нижний Новгород", "dates": "2027-04-01,2027-04-06", "budget": 150000, "passengers": 2, "comfort_level": "стандарт", "transport": "авиа", "interests": "сноубординг", "special_requests": "нужна аренда сноубордов и ботинок, остальное снаряжение есть"}\n'
+        "```\n\n"
+        "**/plan_update** — обновить конкретные параметры:\n"
+        "```json\n"
+        '{"budget": 150000, "passengers": 3}\n'
+        "```\n\n"
+        "Доступные поля:\n"
+        "- destination: куда ехать (Сочи, Шерегеш, Турция)\n"
+        "- departure_city: откуда (Москва, СПб)\n"
+        "- dates: даты (2026-04-15,2026-04-22)\n"
+        "- budget: общий бюджет на всех (число)\n"
+        "- passengers: количество пассажиров (число)\n"
+        "- comfort_level: бюджет/стандарт/премиум\n"
+        "- transport: авиа/жд/авто\n"
+        "- interests: интересы (пляж, экскурсии)\n"
+        "- special_requests: пожелания"
+    )
+    return {
+        "agent_response": template,
+        "messages": [{"role": "assistant", "content": template}],
     }
+
+
+def classify_intent(state: TravelState) -> dict:
+    """Классифицирует намерение и извлекает параметры.
     
-    # Если есть распарсенные даты — добавляем в state
-    if parsed_dates:
-        response["dates"] = parsed_dates
-    
-    return response
-
-
-def select_destination(state: TravelState) -> dict:
+    Поддерживает только команды:
+    1. /plan_create — создать новый план
+    2. /plan_update — обновить существующий план
     """
-    Подбирает направление для поездки. LLM самостоятельно определяет тип отдыха
-    и рекомендует конкретный курорт/город на основе запроса, бюджета и дат.
-
-    Args:
-        state: Текущее состояние графа.
-
-    Returns:
-        Словарь с destination и messages.
-    """
-    from pydantic import BaseModel
-    class DestinationFormat(BaseModel):
-        destination: str
-        reason: str
     user_query = state.get("user_query", "")
-    budget = state.get("budget")
-    dates = state.get("dates")
-    api_key = state.get("api_key")
-    
-    dialog = [
-        {"role": "system", "content": (
-            "Ты — эксперт по путешествиям. Подбери конкретное направление (город/курорт/страну) "
-            "на основе запроса пользователя. Учитывай сезон, бюджет и активность. "
-            "Ответь строго в формате JSON: {destination: 'название', reason: 'краткая причина до 1 предложения'}."
-        )},
-        {"role": "user", "content": user_query +
-            (f"\nБюджет: {budget} руб." if budget else "") +
-            (f"\nДаты: {dates}" if dates else "")},
+
+    # === КОМАНДЫ: /plan_create и /plan_update ===
+    # Парсим JSON напрямую, без LLM — ПЕРВЕЕ всего
+    if user_query.startswith("/"):
+        parts = user_query.split(None, 1)  # split by whitespace
+        command = parts[0].lower()
+        json_str = parts[1] if len(parts) > 1 else ""
+
+        # Пытаемся распарсить JSON напрямую
+        try:
+            # LLM может вернуть кириллические кавычки — чистим ТОЛЬКО кавычки, НЕ кириллицу
+            cleaned = json_str.replace("\u201c", '"').replace("\u201d", '"')
+            cleaned = cleaned.replace("\u2018", "'").replace("\u2019", "'")
+            params = json.loads(cleaned)
+            
+            if not isinstance(params, dict):
+                params = {}
+        except (json.JSONDecodeError, ValueError):
+            params = {}
+
+        # Нормализуем ключи (разные варианты написания)
+        param_map = {
+            "destination": ["destination", "направление", "куда", "курорт", "country", "city"],
+            "departure_city": ["departure_city", "откуда", "from", "departure", "city_from"],
+            "dates": ["dates", "даты", "date", "start_date", "end_date", "period"],
+            "budget": ["budget", "бюджет", "cost", "amount", "price"],
+            "comfort_level": ["comfort_level", "комфорт", "comfort", "class", "standard"],
+            "passengers": ["passengers", "пассажиры", "passenger_count", "people", "adults", "count"],
+            "interests": ["interests", "интересы", "interest", "activities", "hobbies"],
+            "special_requests": ["special_requests", "пожелания", "requests", "preferences", "wishes"],
+            "transport": ["transport", "транспорт", "transport_type", "travel_by"],
+        }
+
+        normalized = {}
+        for std_key, variants in param_map.items():
+            for variant in variants:
+                if variant in params:
+                    normalized[std_key] = params[variant]
+                    break
+        
+        # Преобразуем budget в float
+        if "budget" in normalized:
+            try:
+                normalized["budget"] = float(str(normalized["budget"]).replace(" ", "").replace(",", ""))
+            except (ValueError, TypeError):
+                normalized.pop("budget", None)
+        
+        # Преобразуем passengers в int
+        if "passengers" in normalized:
+            try:
+                normalized["passengers"] = int(normalized["passengers"])
+            except (ValueError, TypeError):
+                normalized.pop("passengers", None)
+
+        if command == "/plan_create":
+            # Создаём новый план — игнорируем старое состояние
+            response = {
+                "intent": "plan",
+                "user_query": user_query,
+                "messages": [],
+                "clarification_count": 0,
+            }
+            # Очищаем все параметры
+            for key in ("destination", "departure_city", "dates", "budget",
+                        "comfort_level", "passengers", "interests", "special_requests",
+                        "transport", "weather", "costs", "exchange_rate", "itinerary"):
+                response[key] = None
+            for key, value in normalized.items():
+                if value is not None:
+                    response[key] = value
+            return response
+
+        elif command == "/plan_update":
+            # Обновляем существующий план — сохраняем старое состояние
+            response = {
+                "intent": "refine",
+                "user_query": user_query,
+                "messages": state.get("messages", []),
+            }
+            # Копируем существующие параметры
+            for key in ("destination", "departure_city", "dates", "budget", 
+                        "comfort_level", "passengers", "interests", "special_requests", "transport"):
+                val = state.get(key)
+                if val is not None:
+                    response[key] = val
+            # Переопределяем новыми значениями
+            for key, value in normalized.items():
+                if value is not None:
+                    response[key] = value
+
+            # Если refine, но destination не задан — показываем шаблон
+            if not response.get("destination"):
+                return show_template(state)
+
+            return response
+
+        # Неизвестная команда — показываем шаблоны
+        return show_template(state)
+
+    # Быстрый ответ на общие вопросы — показываем команды
+    if any(kw in user_query.lower() for kw in ["что ты умеешь", "что ты можешь", "помоги", "как работает"]):
+        return show_template(state)
+
+    # === ФИЛЬТР: только вопросы про путешествия ===
+    travel_keywords = [
+        "отдых", "поездк", "море", "горы", "курорт", "путешеств", "тур",
+        "отель", "билет", "авиа", "поезд", "виза", "бюджет", "маршрут",
+        "проживан", "трансфер", "экскурси", "пляж", "сноуборд", "лыж",
+        "зимн", "летн", "отпуск", "каникул", "направлен", "стран",
+        "город", "загород", "база", "хостел", "ресторан", "кухн",
+        "погода", "сезон", "климат", "активн", "развлечен", "достопримечательност",
+        "авиабилет", "ж/д", "железнодорожн", "автобус", "машина", "авто",
+        "снять", "аренд", "жильё", "жилье", "номер", "завтрак", "питание",
+        "сочи", "шерегеш", "антальи", "стамбул", "москв", "питер", "петербург",
+        "кемеров", "новосибирск", "краснодар", "крым", "дагестан", "азов",
+        "белгород", "нижний", "казань", "самара", "уфа", "екатеринбург",
+        "россия", "россии", "российск", "турция", "турецк", "египет",
+        "таиланд", "тайланд", "оаэ", "оаэ", "дубай", "дубаи", "абудаби",
+        "грузия", "тбилиси", "батуми", "армения", "армянск", "азербайджан",
+        "беларусь", "казахстан", "узбекистан", "кипр", "китай", "япония",
+        "италия", "франция", "испания", "германия", "франция", "греция",
     ]
-    result = llm_call(dialog, structure=DestinationFormat, max_tokens=512, api_key=api_key)
-    return {"destination": result["destination"],
-            "messages": [{"role": "assistant", "content": f"Рекомендую: {result['destination']}"}]}
+    kw_lower = user_query.lower()
+    kw_count = sum(1 for kw in travel_keywords if kw in kw_lower)
 
+    if kw_count < 1:
+        # Не похоже на вопрос про путешествия — показываем команды
+        return show_template(state)
 
-def ask_missing_info(state: TravelState) -> dict:
-    """
-    Определяет недостающие параметры и формирует уточняющий вопрос.
-
-    Args:
-        state: Текущее состояние графа.
-
-    Returns:
-        Словарь с agent_response, messages и asked_missing_info.
-    """
-    from pydantic import BaseModel
-    class MissingInfoFormat(BaseModel):
-        need_clarification: bool
-        missing_fields: List[str]
-        query_to_user: str
-    user_query = state.get("user_query", "")
-    api_key = state.get("api_key")
-    
-    # Проверяем какие поля уже есть
-    missing = []
-    if not state.get("destination"):
-        missing.append("направление")
-    if not state.get("dates"):
-        missing.append("даты")
-    if not state.get("budget"):
-        missing.append("бюджет")
-    if not state.get("comfort_level"):
-        missing.append("комфорт")
-    
-    dialog = [
-        {"role": "system", "content": f"Travel Planner. Задай 1 вопрос. Нужно узнать: {', '.join(missing)}."},
+    # Сообщение про путешествия — передаём в LLM для ответа
+    travel_dialog = [
+        {"role": "system", "content": (
+            "Ты — Travel Planner. Отвечай ТОЛЬКО на вопросы, связанные с путешествиями, "
+            "отдыхом, туризмом, курортами, визами, транспортом, проживанием, бюджетом поездки.\n\n"
+            "Если вопрос НЕ про путешествия — вежливо откажи и предложи использовать команды:\n"
+            "/plan_create — создать новый план\n"
+            "/plan_update — обновить существующий план\n\n"
+            "ВАЖНО: Не задавай вопросов и не проси дополнительную информацию.\n"
+            "Отвечай кратко и по делу на русском языке.\n"
+            "Не используй фразы типа 'Хотите добавить детали?', 'Могу предложить...' и т.д."
+        )},
         {"role": "user", "content": user_query},
     ]
-    result = llm_call(dialog, structure=MissingInfoFormat, max_tokens=512, api_key=api_key)
-    return {
-        "agent_response": result["query_to_user"],
-        "messages": [{"role": "assistant", "content": result["query_to_user"]}],
-        "asked_missing_info": True,
-    }
+    api_key = state.get("api_key")
+    try:
+        answer = llm_call(travel_dialog, structure=None, max_tokens=1024, api_key=api_key)
+        return {
+            "agent_response": answer,
+            "messages": [{"role": "assistant", "content": answer}],
+            "user_query": user_query,
+        }
+    except Exception:
+        return show_template(state)
+
+
+
 
 
 def load_state(state: TravelState) -> dict:
-    """
-    Восстанавливает состояние из JSON-файла по session_id.
-
-    Args:
-        state: Текущее состояние графа.
-
-    Returns:
-        Словарь с agent_response и messages.
-    """
     session_id = state.get("session_id", "")
     states_dir = Path("states")
     state_file = states_dir / f"{state.get('user_id', 'default')}_{session_id}.json"
     if state_file.exists():
         with open(state_file) as f:
             saved = json.load(f)
-        response = f"Данные загружены! Направление: {saved.get('destination', 'не указано')}"
+        # Восстанавливаем все параметры
+        response_parts = [f"Данные загружены!"]
+        if saved.get("destination"):
+            response_parts.append(f"Направление: {saved['destination']}")
+        if saved.get("departure_city"):
+            response_parts.append(f"Откуда: {saved['departure_city']}")
+        if saved.get("dates"):
+            response_parts.append(f"Даты: {saved['dates']}")
+        if saved.get("budget"):
+            response_parts.append(f"Бюджет: {saved['budget']} руб.")
+        if saved.get("comfort_level"):
+            response_parts.append(f"Комфорт: {saved['comfort_level']}")
+        if saved.get("passengers"):
+            response_parts.append(f"Пассажиров: {saved['passengers']}")
+        if saved.get("itinerary"):
+            response_parts.append(f"План: {saved['itinerary'][:200]}...")
+        response = "\n".join(response_parts)
+        # Восстанавливаем параметры в состоянии
+        restore_fields = ["destination", "departure_city", "dates", "budget",
+                          "comfort_level", "passengers", "interests", "special_requests",
+                          "itinerary", "weather", "costs", "exchange_rate"]
+        restore = {}
+        for field in restore_fields:
+            if field in saved:
+                restore[field] = saved[field]
+        restore["agent_response"] = response
+        restore["messages"] = [{"role": "assistant", "content": response}]
+        return restore
     else:
         response = f"Состояние '{session_id}' не найдено."
-    return {"agent_response": response,
-            "messages": [{"role": "assistant", "content": response}]}
+        return {"agent_response": response, "messages": [{"role": "assistant", "content": response}]}
 
 
 def _parse_days(dates_str: str) -> int:
-    """
-    Определяет количество дней из строки дат.
-
-    Args:
-        dates_str: Строка в формате 'YYYY-MM-DD,YYYY-MM-DD'.
-
-    Returns:
-        Количество дней между датами.
-    """
     if not dates_str or "," not in dates_str:
         return 7
     try:
         parts = dates_str.split(",")
         start = datetime.strptime(parts[0].strip(), "%Y-%m-%d")
         end = datetime.strptime(parts[1].strip(), "%Y-%m-%d")
-        delta = (end - start).days
-        return max(delta, 1)
+        return max((end - start).days, 1)
     except (ValueError, IndexError):
         return 7
 
 
+# --- Описание инструментов через pydantic_function_tool (паттерн из 2-го и 6-го занятий) ---
+# LLM получает ТОЛЬКО описания инструментов, реализация вызывается Python-кодом
+
+class GetWeatherTool(BaseModel):
+    """Получить прогноз погоды по координатам на даты поездки."""
+    lat: float = Field(description="Широта (из геокодинга Nominatim)")
+    lon: float = Field(description="Долгота (из геокодинга Nominatim)")
+    dates: str = Field(description="Даты поездки в формате YYYY-MM-DD,YYYY-MM-DD")
+    location: str = Field(default="локация", description="Название места для отображения в ответе")
+
+class GetCostsTool(BaseModel):
+    """Оценить стоимость поездки с учётом комфортного проживания."""
+    location: str = Field(description="Город или курорт")
+    days: int = Field(description="Количество дней поездки")
+    comfort_level: str = Field(description="Уровень комфорта: бюджет, стандарт, премиум")
+
+class GetExchangeRateTool(BaseModel):
+    """Получить курс валют (USD/EUR к RUB)."""
+    from_currency: str = Field(default="USD", description="Исходная валюта (например: USD, EUR)")
+    to_currency: str = Field(default="RUB", description="Целевая валюта (например: RUB)")
+
+class GetGeolocationTool(BaseModel):
+    """Получить координаты и страну по названию города."""
+    location: str = Field(description="Город или место для геокодирования")
+
+
+# Создаём описания инструментов для LLM через pydantic_function_tool
+_get_weather_desc = pydantic_function_tool(GetWeatherTool, name="get_weather")
+_get_costs_desc = pydantic_function_tool(GetCostsTool, name="get_costs")
+_get_exchange_rate_desc = pydantic_function_tool(GetExchangeRateTool, name="get_exchange_rate")
+_get_geolocation_desc = pydantic_function_tool(GetGeolocationTool, name="get_geolocation")
+
+
 def check_weather_budget(state: TravelState) -> dict:
-    """
-    Проверяет погоду и стоимость поездки, сравнивает с бюджетом.
+    """Агентный цикл: LLM сама решает, какие инструменты вызвать.
 
-    Args:
-        state: Текущее состояние графа.
+    Паттерн из 6-го занятия (строки 1018-1064):
+    - LLM получает описания инструментов через pydantic_function_tool
+    - LLM вызывает инструменты через tool_calls
+    - Python исполняет вызовы и возвращает результат с ролью "tool"
+    - Цикл продолжается пока LLM не вернёт финальный ответ
 
-    Returns:
-        Словарь с weather, costs, weather_ok, budget_ok, comfort_level.
+    Если внешний сервис недоступен — LLM видит ошибку в результате
+    и решает, как действовать дальше (другой инструмент или альтернатива).
     """
     destination = state.get("destination", "")
     dates = state.get("dates", "")
     budget = state.get("budget")
-    comfort = state.get("comfort_level", "standard")
-    
-    # Определяем реальное количество дней
-    days = _parse_days(dates)
-    
-    weather_result = get_weather_forecast(destination, dates)
-    costs_result = get_travel_costs(destination, days, comfort)
-    weather_ok = "ошибка" not in weather_result.lower()
-    
-    # Проверяем бюджет: извлекаем итоговую сумму из costs_result
-    budget_ok = True
-    if budget is not None:
-        import re
-        cost_match = re.search(r"итого ~\$(\d+)", costs_result)
-        if cost_match:
-            total_usd = int(cost_match.group(1))
-            # Получаем реальный курс через API
-            rate_info = get_exchange_rates("USD", "RUB")
-            try:
-                rate = float(rate_info.split("=")[1].split()[0])
-            except (IndexError, ValueError):
-                rate = 95  # fallback
-            rub_budget = total_usd * rate
-            if rub_budget > budget:
-                budget_ok = False
-    
-    return {"weather": weather_result, "costs": costs_result,
-            "weather_ok": weather_ok, "budget_ok": budget_ok,
-            "comfort_level": comfort,
-            "messages": [{"role": "assistant", "content": f"Погода OK={weather_ok}, бюджет OK={budget_ok}"}]}
-
-
-def suggest_alternatives(state: TravelState) -> dict:
-    """
-    Предлагает альтернативные направления при плохой погоде или превышении бюджета.
-
-    Args:
-        state: Текущее состояние графа.
-
-    Returns:
-        Словарь с alternatives и messages.
-    """
-    destination = state.get("destination", "")
-    user_query = state.get("user_query", "")
+    comfort = state.get("comfort_level", "стандарт")
+    passengers = state.get("passengers", 1)
+    departure_city = state.get("departure_city", "Москва")
     api_key = state.get("api_key")
-    dialog = [
-        {"role": "system", "content": """Ты — Travel Planner. Предложи 2-3 альтернативные направления для поездки, которые лучше соответствуют запросу пользователя.
-Укажи: название, почему подходит, примерная стоимость, лучший сезон. Кратко."""},
-        {"role": "user", "content": f"Выбрано: {destination}. Запрос: {user_query}"},
+    days = _parse_days(dates) if dates else 7
+
+    # Описание инструментов (только текстовая часть — LLM решает какие вызвать)
+    tools = [
+        _get_weather_desc,
+        _get_geolocation_desc,
+        _get_costs_desc,
+        _get_exchange_rate_desc,
     ]
-    result = llm_call(dialog, model=DEFAULT_MODEL, max_tokens=4096, api_key=api_key)
-    return {"alternatives": result,
-            "messages": [{"role": "assistant", "content": result}]}
+
+    # Маппинг названий инструментов на Python-функции
+    TOOL_MAP = {
+        "get_weather": get_weather_forecast,
+        "get_geolocation": get_geolocation,
+        "get_costs": get_travel_costs,
+        "get_exchange_rate": get_exchange_rates,
+    }
+
+    # Системный промпт — даём LLM контекст поездки
+    agent_system = (
+        "Ты — Travel Planner. Тебе нужно собрать данные для составления плана поездки.\n\n"
+        "Доступные инструменты:\n"
+        "- get_geolocation: координаты города и страна (нужен location)\n"
+        "- get_weather: прогноз погоды по координатам (нужны lat, lon из geolocation)\n"
+        "- get_costs: оценка стоимости поездки (нужны location, days, comfort_level)\n"
+        "- get_exchange_rate: курс валют (нужны from_currency, to_currency)\n\n"
+        "Порядок вызовов:\n"
+        "1. Сначала вызови get_geolocation для получения координат.\n"
+        "2. Затем вызови get_weather с полученными lat и lon.\n"
+        "3. Затем вызови get_costs для оценки бюджета.\n"
+        "4. Вызови get_exchange_rate для курса USD→RUB.\n\n"
+        "Информация о поездке:\n"
+        f"- Направление: {destination}\n"
+        f"- Даты: {dates if dates else 'не указаны'}\n"
+        f"- Бюджет: {budget if budget else 'не указан'} руб.\n"
+        f"- Пассажиров: {passengers}\n"
+        f"- Откуда: {departure_city if departure_city else 'не указано'}\n"
+        f"- Комфорт: {comfort}\n\n"
+        "Правила:\n"
+        "1. Сначала вызови get_geolocation для получения координат.\n"
+        "2. Затем вызови get_weather с полученными lat и lon.\n"
+        "3. Затем вызови get_costs для оценки бюджета.\n"
+        "4. Вызови get_exchange_rate для курса USD→RUB.\n"
+        "5. После всех вызовов верни финальный ответ с итогами каждого инструмента.\n"
+        "6. Если сервис недоступен — сообщи об этом и предложи продолжить без него."
+    )
+
+    # Agent loop — точный паттерн из 6-го занятия (строки 1032-1064)
+    messages = [
+        {"role": "system", "content": agent_system},
+        {"role": "user", "content": f"Собери данные для поездки в {destination}."}
+    ]
+
+    # Собираем результаты инструментов
+    weather_result = ""
+    geolocation_result = ""
+    costs_result = ""
+    exchange_result = ""
+
+    max_iterations = 10
+    for _ in range(max_iterations):
+        key = api_key or GIGACHAT_KEY
+        client = OpenAI(
+            api_key=key,
+            base_url="https://foundation-models.api.cloud.ru/v1",
+        )
+        resp = client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=messages,
+            tools=tools,
+            temperature=0.0,
+            max_tokens=1024
+        )
+        message = resp.choices[0].message
+        messages.append(message)
+
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                name = tool_call.function.name
+                arguments = json.loads(tool_call.function.arguments)
+                fn = TOOL_MAP.get(name)
+                if fn:
+                    function_result = fn(**arguments)
+                else:
+                    function_result = f"Неизвестный инструмент: {name}"
+
+                # Сохраняем результаты инструментов в state
+                if name == "get_weather":
+                    weather_result = function_result
+                elif name == "get_geolocation":
+                    geolocation_result = function_result
+                elif name == "get_costs":
+                    costs_result = function_result
+                elif name == "get_exchange_rate":
+                    exchange_result = function_result
+
+                # Результат возвращаем как json.dumps({"result": ...}) — паттерн из 6-го занятия
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps({"result": function_result}, ensure_ascii=False)
+                })
+        else:
+            # LLM вернула финальный ответ — выходим из цикла
+            final_answer = message.content or ""
+            break
+
+    return {
+        "agent_response": final_answer,
+        "weather": weather_result,
+        "costs": costs_result,
+        "exchange_rate": exchange_result,
+        "messages": [{"role": "assistant", "content": final_answer}]
+    }
 
 
 def build_itinerary(state: TravelState) -> dict:
-    """
-    Составляет детальный план поездки с использованием reasoning-модели.
-
-    Args:
-        state: Текущее состояние графа.
-
-    Returns:
-        Словарь с itinerary и messages.
-    """
     destination = state.get("destination", "")
     weather = state.get("weather", "")
     costs = state.get("costs", "")
+    exchange_rate = state.get("exchange_rate", "")
     budget = state.get("budget")
     dates = state.get("dates", "")
-    comfort = state.get("comfort_level", "standard")
-    user_query = state.get("user_query", "")
+    comfort = state.get("comfort_level", "стандарт")
+    passengers = state.get("passengers", 1)
+    departure_city = state.get("departure_city", "Москва")
+    interests = state.get("interests", "")
+    special_requests = state.get("special_requests", "")
     api_key = state.get("api_key")
-    dialog = [
-        {"role": "system", "content": """Ты — профессиональный туристический планировщик.
-Составь детальный план поездки на основе ВСЕХ данных. Используй точные даты из запроса.
-Включи: транспорт, проживание, достопримечательности, питание, бюджет по дням.
-Будь конкретным и практичным."""},
-        {"role": "user", "content": f"Направление: {destination}\nДаты: {dates}\nБюджет: {budget} руб.\nУровень комфорта: {comfort}\nПогода: {weather}\nСтоимость: {costs}\nЗапрос: {user_query}"},
+
+    # Предупреждение если погода недоступна
+    weather_warning = ""
+    if weather and ("недоступен" in weather.lower() or "ошибка" in weather.lower() or "временно недоступен" in weather.lower()):
+        weather_warning = "\n⚠️ ВНИМАНИЕ: Прогноз погоды недоступен. План составлен без учёта погодных условий."
+        weather = ""
+
+    # Предупреждение если курс валют недоступен
+    exchange_warning = ""
+    if exchange_rate and ("недоступен" in exchange_rate.lower() or "ошибка" in exchange_rate.lower()):
+        exchange_warning = "\n⚠️ ВНИМАНИЕ: Курс валют недоступен. План составлен без учёта актуального курса."
+        exchange_rate = ""
+
+    # Формируем контекст — пропускаем отсутствующие параметры
+    context_parts = [
+        f"Направление: {destination}",
+        f"Даты: {dates}" if dates else "Даты: не указаны",
+        f"Бюджет: {budget} руб. (общий на {passengers} чел.)" if budget else f"Бюджет: не указан (на {passengers} чел.)",
+        f"Пассажиров: {passengers}",
+        f"Откуда: {departure_city}" if departure_city else "Откуда: не указано",
+        f"Комфорт: {comfort}",
+        f"Погода: {weather}" if weather else "Погода: не проверена",
+        f"Курс валют: {exchange_rate}" if exchange_rate else "Курс валют: не проверен",
+        f"Интересы: {interests}" if interests else "Интересы: не указаны",
+        f"Пожелания: {special_requests}" if special_requests else "Пожелания: не указаны",
     ]
-    result = llm_call(dialog, model=REASONING_MODEL, max_tokens=4096, api_key=api_key)
-    return {"itinerary": result,
-            "messages": [{"role": "assistant", "content": result}]}
+    context = "\n".join(context_parts)
+
+    dialog = [
+        {"role": "system", "content": (
+            "Ты — профессиональный туристический планировщик. Составь детальный план поездки.\n"
+            "Включи: транспорт, проживание, достопримечательности, питание, бюджет по дням.\n"
+            "Укажи ссылки на Aviasales, RZD, Booking.\n"
+            "Используй год 2026 для всех дат.\n"
+            "Если погода недоступна — укажи это в предупреждении.\n"
+            "Бюджет — ОБЩИЙ на всех пассажиров. Цены должны быть реалистичными.\n\n"
+            "Ориентиры цен (руб., 2026):\n"
+            "- Авиабилеты Москва-Сочи: 8000-15000 туда-обратно\n"
+            "- Авиабилеты Москва-Шерегеш (через Новосибирск): 12000-20000 туда-обратно\n"
+            "- Проживание в Сочи (стандарт): 3000-5000/ночь\n"
+            "- Проживание в Шерегеш (стандарт): 3500-5000/ночь\n"
+            "- Проживание в Турции (all inclusive): 8000-15000/ночь\n"
+            "- Ски-пасс Шерегеш: 2000-3000/день\n"
+            "- Прокат сноуборда: 1500/день\n"
+            "- Средний чек в кафе: 1000-1500/чел\n"
+            "- Экскурсия в Луксор: 5000-8000/чел\n"
+            "Не указывай цены, которых не существует. Используй реалистичные диапазоны."
+        )},
+        {"role": "user", "content": context + weather_warning},
+    ]
+    result = llm_call(dialog, max_tokens=1024, api_key=api_key)
+    return {"itinerary": result, "messages": [{"role": "assistant", "content": result}]}
 
 
 def save_state(state: TravelState) -> dict:
-    """
-    Сериализует состояние в JSON-файл для долгосрочного хранения.
-
-    Args:
-        state: Текущее состояние графа.
-
-    Returns:
-        Словарь с agent_response и messages.
-    """
     user_id = state.get("user_id", "default")
     session_id = state.get("session_id", "session_1")
     states_dir = Path("states")
     states_dir.mkdir(exist_ok=True)
     state_file = states_dir / f"{user_id}_{session_id}.json"
     data_to_save = {
-        "user_id": user_id, "session_id": session_id,
+        "user_id": user_id,
+        "session_id": session_id,
         "destination": state.get("destination"),
+        "departure_city": state.get("departure_city"),
+        "dates": state.get("dates"),
         "budget": state.get("budget"),
+        "comfort_level": state.get("comfort_level"),
+        "passengers": state.get("passengers"),
+        "interests": state.get("interests"),
+        "special_requests": state.get("special_requests"),
         "itinerary": state.get("itinerary"),
+        "weather": state.get("weather"),
+        "costs": state.get("costs"),
+        "exchange_rate": state.get("exchange_rate"),
         "saved_at": datetime.now().isoformat(),
+        "conversation_history": [
+            msg for msg in state.get("messages", [])
+            if isinstance(msg, dict) and msg.get("role") in ("user", "assistant")
+        ],
     }
     with open(state_file, "w") as f:
         json.dump(data_to_save, f, ensure_ascii=False, indent=2)
-    return {"agent_response": "План сохранён.",
-            "messages": [{"role": "assistant", "content": "План сохранён."}]}
+    
+    # Возвращаем itinerary в ответе
+    itinerary = state.get("itinerary", "")
+    if itinerary:
+        agent_response = f"✅ **План поездки сохранён!**\n\n{itinerary}"
+    else:
+        agent_response = "План сохранён."
+    
+    return {
+        "agent_response": agent_response,
+        "itinerary": itinerary,
+        "messages": [{"role": "assistant", "content": agent_response}]
+    }
 
 
 # --- Routing ---
 def route_intent(state: TravelState) -> str:
-    """
-    Определяет следующий узел после classify_intent.
-
-    Args:
-        state: Текущее состояние графа.
-
-    Returns:
-        Название следующего узла.
+    """Динамический роутинг с минимум 3 путями. БЕЗ ЦИКЛОВ.
+    
+    classify_intent уже обработал refine и обновил state.
+    Здесь только маршрутизация по intent.
     """
     intent = state.get("intent", "unknown")
+    clarification_count = state.get("clarification_count", 0)
+    destination = state.get("destination")
+
+    # Путь 1: recall — восстановить сохранённый план
     if intent == "recall":
         return "load_state"
-    elif intent == "refine":
-        # При уточнении — если есть направление, идём пересчитывать
-        if state.get("destination"):
+
+    # Путь 2: unknown — общие вопросы, ответ и завершение
+    if intent == "unknown":
+        return "__end__"
+
+    # Путь 3: refine — изменить существующий план
+    if intent == "refine":
+        if destination:
             return "check_weather_budget"
-        # Иначе уточняем
-        return "ask_missing_info"
-    elif intent == "plan":
-        # Если уже задавали уточняющие — идём подбирать направление
-        if state.get("asked_missing_info"):
-            return "select_destination"
-        # Если все поля уже есть — проверяем, конкретное ли направление
-        if (state.get("destination") and 
-            state.get("dates") and 
-            state.get("budget") and 
-            state.get("comfort_level")):
+        return "__end__"
+
+    # Путь 4: plan — спланировать новую поездку
+    if intent == "plan":
+        if destination:
             return "check_weather_budget"
-        # Иначе сначала уточняем
-        return "ask_missing_info"
-    elif intent == "unknown":
-        # Если есть готовый ответ (общий вопрос) — сразу END
-        if state.get("agent_response"):
-            return "__end__"
-        return "ask_missing_info"
-    else:
-        return "ask_missing_info"
 
-
-def route_check(state: TravelState) -> str:
-    """
-    Определяет следующий узел после check_weather_budget.
-
-    Args:
-        state: Текущее состояние графа.
-
-    Returns:
-        'build_itinerary' если всё OK, 'suggest_alternatives' иначе.
-    """
-    weather_ok = state.get("weather_ok", True)
-    budget_ok = state.get("budget_ok", True)
-    if not weather_ok or not budget_ok:
-        return "suggest_alternatives"
-    return "build_itinerary"
+    return "__end__"
 
 
 # --- Graph ---
 graph_builder = StateGraph(TravelState)
 graph_builder.add_node("classify_intent", classify_intent)
-graph_builder.add_node("select_destination", select_destination)
-graph_builder.add_node("ask_missing_info", ask_missing_info)
 graph_builder.add_node("load_state", load_state)
 graph_builder.add_node("check_weather_budget", check_weather_budget)
-graph_builder.add_node("suggest_alternatives", suggest_alternatives)
 graph_builder.add_node("build_itinerary", build_itinerary)
 graph_builder.add_node("save_state", save_state)
 
 graph_builder.add_edge(START, "classify_intent")
 graph_builder.add_conditional_edges("classify_intent", route_intent, {
-    "select_destination": "select_destination",
-    "ask_missing_info": "ask_missing_info",
     "load_state": "load_state",
+    "check_weather_budget": "check_weather_budget",
     "__end__": END,
 })
-graph_builder.add_edge("select_destination", "check_weather_budget")
-graph_builder.add_edge("ask_missing_info", "check_weather_budget")
 graph_builder.add_edge("load_state", END)
-graph_builder.add_conditional_edges("check_weather_budget", route_check, {
-    "build_itinerary": "build_itinerary",
-    "suggest_alternatives": "suggest_alternatives",
-})
-graph_builder.add_edge("suggest_alternatives", "ask_missing_info")
+graph_builder.add_edge("check_weather_budget", "build_itinerary")
 graph_builder.add_edge("build_itinerary", "save_state")
 graph_builder.add_edge("save_state", END)
 
@@ -614,11 +766,16 @@ class ChatRequest(BaseModel):
     user_id: str = Field(default="default")
     session_id: str = Field(default="session_1")
     message: str
-    context: str = ""  # история чата
-    budget: Optional[float] = None  # без дефолта!
-    dates: Optional[str] = None  # без дефолта!
-    comfort_level: Optional[str] = None  # без дефолта!
-    api_key: Optional[str] = None  # ключ GigaChat из UI
+    context: str = ""
+    budget: Optional[float] = None
+    dates: Optional[str] = None
+    comfort_level: Optional[str] = None
+    passengers: Optional[int] = None
+    departure_city: Optional[str] = None
+    interests: Optional[str] = None
+    special_requests: Optional[str] = None
+    transport: Optional[str] = None
+    api_key: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -628,145 +785,231 @@ class ChatResponse(BaseModel):
     session_id: str
 
 
+class PlanCreateRequest(BaseModel):
+    user_id: str = Field(default="default")
+    session_id: str = Field(default="session_1")
+    destination: Optional[str] = None
+    departure_city: Optional[str] = None
+    dates: Optional[str] = None
+    budget: Optional[float] = None
+    comfort_level: Optional[str] = None
+    passengers: Optional[int] = None
+    interests: Optional[str] = None
+    special_requests: Optional[str] = None
+    transport: Optional[str] = None
+    api_key: Optional[str] = None
+
+
+class PlanUpdateRequest(BaseModel):
+    user_id: str = Field(default="default")
+    session_id: str = Field(default="session_1")
+    destination: Optional[str] = None
+    departure_city: Optional[str] = None
+    dates: Optional[str] = None
+    budget: Optional[float] = None
+    comfort_level: Optional[str] = None
+    passengers: Optional[int] = None
+    interests: Optional[str] = None
+    special_requests: Optional[str] = None
+    transport: Optional[str] = None
+    api_key: Optional[str] = None
+
+
 # --- FastAPI app ---
 app = FastAPI(title="Travel Planner Agent", version="1.0.0")
 
 
+@app.post("/plan_create", response_model=ChatResponse)
+async def plan_create(payload: PlanCreateRequest):
+    """Создать новый план поездки — игнорирует старое состояние."""
+    thread_id = f"{payload.user_id}_{payload.session_id}"
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Сбрасываем checkpointer — удаляем старое состояние
+    graph.update_state(config, {"messages": []}, as_node=START)
+
+    # Сбрасываем состояние — начинаем с чистого листа
+    params_dict = {k: v for k, v in payload.__dict__.items() if v is not None}
+    user_query = f"/plan_create {json.dumps(params_dict, ensure_ascii=False)}"
+
+    state_update = {
+        "intent": "plan",
+        "user_query": user_query,
+        "messages": [{"role": "user", "content": "/plan_create"}],
+        "clarification_count": 0,
+    }
+    # Очищаем старые параметры
+    for key in ("destination", "departure_city", "dates", "budget",
+                "comfort_level", "passengers", "interests", "special_requests",
+                "transport", "weather", "costs", "exchange_rate", "itinerary"):
+        state_update[key] = None
+
+    # Добавляем новые параметры
+    for key, value in params_dict.items():
+        if key in ("destination", "departure_city", "dates", "budget",
+                   "comfort_level", "passengers", "interests", "special_requests", "transport", "api_key"):
+            state_update[key] = value
+
+    graph.update_state(config, state_update)
+
+    result = graph.invoke(None, config)
+    return ChatResponse(
+        response=result.get("agent_response", ""),
+        destination=result.get("destination"),
+        itinerary=result.get("itinerary"),
+        session_id=payload.session_id,
+    )
+
+
+@app.post("/plan_update", response_model=ChatResponse)
+async def plan_update(payload: PlanUpdateRequest):
+    """Обновить существующий план — сохраняет не изменённые параметры."""
+    thread_id = f"{payload.user_id}_{payload.session_id}"
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = graph.get_state(config)
+
+    # Читаем текущее состояние — из checkpointer или из JSON-файла
+    saved = dict(snapshot.values) if snapshot.values else {}
+    if not saved:
+        # Состояние пустое — читаем из JSON-файла
+        states_dir = Path("states")
+        state_file = states_dir / f"{payload.user_id}_{payload.session_id}.json"
+        if state_file.exists():
+            with open(state_file) as f:
+                saved = json.load(f)
+            # Убираем поля, которых нет в TravelState
+            saved = {k: v for k, v in saved.items() if k in TravelState.__annotations__}
+
+    # Копируем ВСЕ параметры из сохранённого состояния
+    update = {
+        "intent": "refine",
+        "user_query": "/plan_update",
+        "messages": [{"role": "user", "content": "/plan_update"}],
+        "destination": saved.get("destination"),
+        "departure_city": saved.get("departure_city"),
+        "dates": saved.get("dates"),
+        "budget": saved.get("budget"),
+        "comfort_level": saved.get("comfort_level"),
+        "passengers": saved.get("passengers"),
+        "interests": saved.get("interests"),
+        "special_requests": saved.get("special_requests"),
+        "transport": saved.get("transport"),
+        "api_key": saved.get("api_key"),
+    }
+
+    # Переопределяем ТОЛЬКО переданные параметры
+    for key in ("destination", "departure_city", "dates", "budget",
+                "comfort_level", "passengers", "interests", "special_requests", "transport", "api_key"):
+        val = getattr(payload, key)
+        if val is not None:
+            update[key] = val
+
+    # Очищаем старые результаты — они будут пересчитаны
+    update["itinerary"] = None
+    update["weather"] = None
+    update["costs"] = None
+    update["exchange_rate"] = None
+    update["agent_response"] = ""
+
+    # Принудительно перезапускаем граф с обновлённым состоянием
+    # Используем update_state с as_node для указания точки входа
+    graph.update_state(config, update, as_node="classify_intent")
+
+    result = graph.invoke(None, config)
+    return ChatResponse(
+        response=result.get("agent_response", ""),
+        destination=result.get("destination"),
+        itinerary=result.get("itinerary"),
+        session_id=payload.session_id,
+    )
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(payload: ChatRequest):
-    """
-    Основной эндпоинт для синхронного вызова агента.
+    thread_id = f"{payload.user_id}_{payload.session_id}"
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = graph.get_state(config)
 
-    Args:
-        payload: Запрос с message, session_id, api_key и др.
-
-    Returns:
-        ChatResponse с response, destination, itinerary.
-
-    Raises:
-        HTTPException: При ошибке обработки запроса.
-    """
-    try:
+    if snapshot.next:
+        # Продолжаем с места остановки (уточнение параметров)
+        current_values = snapshot.values
+        current_values["user_query"] = payload.message
+        current_values["messages"].append({"role": "user", "content": payload.message})
+        if payload.budget is not None:
+            current_values["budget"] = payload.budget
+        if payload.dates:
+            current_values["dates"] = payload.dates
+        if payload.comfort_level:
+            current_values["comfort_level"] = payload.comfort_level
+        if payload.passengers:
+            current_values["passengers"] = payload.passengers
+        if payload.departure_city:
+            current_values["departure_city"] = payload.departure_city
+        if payload.interests:
+            current_values["interests"] = payload.interests
+        if payload.special_requests:
+            current_values["special_requests"] = payload.special_requests
+        if payload.api_key:
+            current_values["api_key"] = payload.api_key
+        graph.update_state(config, current_values)
+        result = graph.invoke(None, config)
+    else:
+        # Граф завершён — читаем последнее состояние из checkpointer
+        # и merge с новыми параметрами из payload
+        saved_state = dict(snapshot.values) if snapshot.values else {}
+        
         initial_state: TravelState = {
             "user_id": payload.user_id,
             "session_id": payload.session_id,
             "user_query": payload.message,
-            "budget": payload.budget,
-            "dates": payload.dates,
-            "comfort_level": payload.comfort_level,
-            "messages": [{"role": "user", "content": payload.context}],
+            "messages": [{"role": "user", "content": payload.message}],
             "api_key": payload.api_key,
         }
-        config = {"configurable": {"thread_id": f"{payload.user_id}_{payload.session_id}"}}
+        # Merge: берём сохранённые параметры, переопределяем новыми
+        for key in ("budget", "dates", "comfort_level", "passengers",
+                    "departure_city", "interests", "special_requests"):
+            if payload.__dict__.get(key) is not None:
+                initial_state[key] = payload.__dict__[key]
+            elif key in saved_state and saved_state[key] is not None:
+                initial_state[key] = saved_state[key]
+        # destination и другие поля
+        for key in ("destination",):
+            if key in saved_state and saved_state[key] is not None:
+                initial_state[key] = saved_state[key]
+        
         result = graph.invoke(initial_state, config)
-        return ChatResponse(
-            response=result.get("agent_response", ""),
-            destination=result.get("destination"),
-            itinerary=result.get("itinerary"),
-            session_id=payload.session_id,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка агента: {str(e)}")
 
-
-@app.post("/chat/stream")
-async def chat_stream(payload: ChatRequest):
-    """
-    Эндпоинт для стримингового вызова агента через SSE.
-
-    Args:
-        payload: Запрос с message, session_id, api_key и др.
-
-    Returns:
-        StreamingResponse с токенами в формате SSE.
-
-    Raises:
-        HTTPException: При ошибке обработки запроса.
-    """
-    try:
-        initial_state: TravelState = {
-            "user_id": payload.user_id,
-            "session_id": payload.session_id,
-            "user_query": payload.message,
-            "budget": payload.budget,
-            "dates": payload.dates,
-            "comfort_level": payload.comfort_level,
-            "messages": [{"role": "user", "content": payload.context}],
-            "api_key": payload.api_key,
-        }
-        config = {"configurable": {"thread_id": f"{payload.user_id}_{payload.session_id}"}}
-
-        async def event_generator():
-            async for event in graph.astream_events(initial_state, config, version="v2"):
-                event_type = event.get("event", "")
-                if event_type == "on_chain_end":
-                    data = event.get("data", {})
-                    yield f"data: {json.dumps({'type': 'end', 'output': data}, ensure_ascii=False)}\n\n"
-                elif event_type == "on_chat_model_stream":
-                    content = event.get("data", {}).get("chunk", {}).get("content", "")
-                    if content:
-                        yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка агента: {str(e)}")
+    return ChatResponse(
+        response=result.get("agent_response", ""),
+        destination=result.get("destination"),
+        itinerary=result.get("itinerary"),
+        session_id=payload.session_id,
+    )
 
 
 @app.get("/state/{session_id}")
 async def get_state(session_id: str, user_id: str = "default"):
-    """
-    Получение сохранённого состояния сессии из JSON-файла.
-
-    Args:
-        session_id: ID сессии.
-        user_id: ID пользователя.
-
-    Returns:
-        Словарь со статусом и данными.
-    """
-    try:
-        states_dir = Path("states")
-        state_file = states_dir / f"{user_id}_{session_id}.json"
-        if state_file.exists():
-            with open(state_file) as f:
-                data = json.load(f)
-            return {"status": "found", "data": data}
-        else:
-            return {"status": "not_found", "message": f"Сессия {session_id} не найдена"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    session_id = session_id
+    states_dir = Path("states")
+    state_file = states_dir / f"{user_id}_{session_id}.json"
+    if state_file.exists():
+        with open(state_file) as f:
+            return json.load(f)
+    return {"error": "Состояние не найдено"}
 
 
 @app.post("/reset/{session_id}")
 async def reset_state(session_id: str, user_id: str = "default"):
-    """
-    Очистка сохранённого состояния сессии.
-
-    Args:
-        session_id: ID сессии.
-        user_id: ID пользователя.
-
-    Returns:
-        Словарь со статусом операции.
-    """
-    try:
-        states_dir = Path("states")
-        state_file = states_dir / f"{user_id}_{session_id}.json"
-        if state_file.exists():
-            state_file.unlink()
-            return {"status": "reset", "message": f"Сессия {session_id} очищена"}
-        else:
-            return {"status": "not_found", "message": f"Сессия {session_id} не найдена"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    states_dir = Path("states")
+    state_file = states_dir / f"{user_id}_{session_id}.json"
+    if state_file.exists():
+        state_file.unlink()
+    return {"status": "Состояние сброшено"}
 
 
 @app.get("/health")
 async def health():
-    """Health-check эндпоинт для проверки работоспособности сервиса."""
-    return {"status": "ok", "model": DEFAULT_MODEL}
+    resp = requests.get(f"{BASE_URL}/models", timeout=5.0)
+    models = resp.json().get("data", [])
+    available = [m["id"] for m in models if "GigaChat" in m["id"]]
+    return {"status": "ok", "model": DEFAULT_MODEL, "llm": f"available models: {len(available)}"}
